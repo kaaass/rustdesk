@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use hbb_common::tcp::FramedStream;
 use hbb_common::{
-    allow_err,
+    allow_err, anyhow,
     anyhow::bail,
     config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT},
     futures::future::join_all,
@@ -183,24 +183,8 @@ impl RendezvousMediator {
                                         update_latency();
                                         if rpr.request_pk {
                                             log::info!("request_pk received from {}", host);
-                                            allow_err!(rz.register_pk(&mut socket).await);
+                                            allow_err!(rz.register_pk().await);
                                             continue;
-                                        }
-                                    }
-                                    Some(rendezvous_message::Union::RegisterPkResponse(rpr)) => {
-                                        update_latency();
-                                        match rpr.result.enum_value() {
-                                            Ok(register_pk_response::Result::OK) => {
-                                                Config::set_key_confirmed(true);
-                                                Config::set_host_key_confirmed(&rz.host_prefix, true);
-                                                *SOLVING_PK_MISMATCH.lock().unwrap() = "".to_owned();
-                                            }
-                                            Ok(register_pk_response::Result::UUID_MISMATCH) => {
-                                                allow_err!(rz.handle_uuid_mismatch(&mut socket).await);
-                                            }
-                                            _ => {
-                                                log::error!("unknown RegisterPkResponse");
-                                            }
                                         }
                                     }
                                     Some(rendezvous_message::Union::PunchHole(ph)) => {
@@ -423,23 +407,61 @@ impl RendezvousMediator {
         Ok(())
     }
 
-    async fn register_pk(&mut self, socket: &mut FramedSocket) -> ResultType<()> {
-        let mut msg_out = Message::new();
-        let pk = Config::get_key_pair().1;
-        let uuid = hbb_common::get_uuid();
-        let id = Config::get_id();
-        self.last_id_pk_registry = id.clone();
-        msg_out.set_register_pk(RegisterPk {
-            id,
-            uuid: uuid.into(),
-            pk: pk.into(),
-            ..Default::default()
-        });
-        socket.send(&msg_out, self.addr.to_owned()).await?;
-        Ok(())
+    async fn register_pk(&mut self) -> ResultType<()> {
+        loop {
+            let mut socket = socket_client::connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+
+            // Send RegisterPk
+            let mut msg_out = Message::new();
+            let pk = Config::get_key_pair().1;
+            let uuid = hbb_common::get_uuid();
+            let id = Config::get_id();
+
+            self.last_id_pk_registry = id.clone();
+            msg_out.set_register_pk(RegisterPk {
+                id,
+                uuid: uuid.into(),
+                pk: pk.into(),
+                ..Default::default()
+            });
+            socket.send(&msg_out).await?;
+
+            // Wait RegisterPkResponse
+            if let Some(msg_in) =
+                crate::common::get_next_nonkeyexchange_msg(&mut socket, None).await
+            {
+                match msg_in.union {
+                    Some(rendezvous_message::Union::RegisterPkResponse(rpr)) => {
+                        match rpr.result.enum_value() {
+                            Ok(register_pk_response::Result::OK) => {
+                                Config::set_key_confirmed(true);
+                                Config::set_host_key_confirmed(&self.host_prefix, true);
+                                *SOLVING_PK_MISMATCH.lock().unwrap() = "".to_owned();
+                                return Ok(()); // success
+                            }
+                            Ok(register_pk_response::Result::UUID_MISMATCH) => {
+                                if self.handle_uuid_mismatch().await.is_ok() {
+                                    return Ok(()); // success
+                                }
+                                // Try using another id
+                                continue;
+                            }
+                            _ => {
+                                log::error!("unknown RegisterPkResponse");
+                                return Err(anyhow::anyhow!("unknown RegisterPkResponse"));
+                            }
+                        }
+                    }
+                    _ => {
+                        log::error!("Unexpected protobuf msg received: {:?}", msg_in);
+                        return Err(anyhow::anyhow!("Unexpected protobuf msg received"));
+                    }
+                }
+            }
+        }
     }
 
-    async fn handle_uuid_mismatch(&mut self, socket: &mut FramedSocket) -> ResultType<()> {
+    async fn handle_uuid_mismatch(&mut self) -> ResultType<()> {
         if self.last_id_pk_registry != Config::get_id() {
             return Ok(());
         }
@@ -450,11 +472,11 @@ impl RendezvousMediator {
                 Config::set_key_confirmed(false);
                 Config::update_id();
                 *solving = self.host.clone();
+                return Err(anyhow::anyhow!("Need resend RegisterPk"));
             } else {
                 return Ok(());
             }
         }
-        self.register_pk(socket).await
     }
 
     async fn register_peer(&mut self, socket: &mut FramedSocket) -> ResultType<()> {
@@ -466,7 +488,7 @@ impl RendezvousMediator {
                 "register_pk of {} due to key not confirmed",
                 self.host_prefix
             );
-            return self.register_pk(socket).await;
+            return self.register_pk().await;
         }
         let id = Config::get_id();
         log::trace!(
